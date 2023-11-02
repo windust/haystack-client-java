@@ -17,22 +17,40 @@
 package com.expedia.www.haystack.client.dispatchers;
 
 import com.expedia.www.haystack.client.Span;
-import com.expedia.www.haystack.client.metrics.*;
+import com.expedia.www.haystack.client.metrics.Counter;
+import com.expedia.www.haystack.client.metrics.Gauge;
+import com.expedia.www.haystack.client.metrics.Metrics;
+import com.expedia.www.haystack.client.metrics.MetricsRegistry;
+import com.expedia.www.haystack.client.metrics.Tag;
+import com.expedia.www.haystack.client.metrics.Timer;
 import com.expedia.www.haystack.client.metrics.Timer.Sample;
 import com.expedia.www.haystack.remote.clients.Client;
 import com.expedia.www.haystack.remote.clients.ClientException;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
+import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.lang3.builder.ReflectionToStringBuilder;
 import org.apache.commons.lang3.builder.ToStringStyle;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.util.Arrays;
-import java.util.Collection;
-import java.util.concurrent.*;
-import java.util.concurrent.atomic.AtomicBoolean;
 
+@Slf4j
 public class RemoteDispatcher implements Dispatcher {
     private static final Logger LOGGER = LoggerFactory.getLogger(RemoteDispatcher.class);
+    public static final String STATE = "state";
+    public static final String CLOSE_NAME = "close";
 
     private final BlockingQueue<Span> acceptQueue;
     private final ScheduledExecutorService executor;
@@ -55,7 +73,9 @@ public class RemoteDispatcher implements Dispatcher {
     private final Counter closeExceptionCounter;
     private final Timer flushTimer;
 
-    public RemoteDispatcher(Metrics metrics, Client client, BlockingQueue<Span> queue, long flushInterval, long shutdownTimeout, ScheduledExecutorService executor) {
+    public RemoteDispatcher(final Metrics metrics, final Client<Span> client, final BlockingQueue<Span> queue,
+                            final long flushInterval, final long shutdownTimeout,
+                            final ScheduledExecutorService executor) {
         this.client = client;
         this.acceptQueue = queue;
         this.executor = executor;
@@ -68,28 +88,30 @@ public class RemoteDispatcher implements Dispatcher {
             public void run() {
                 try {
                     flush();
-                } catch (ClientException e) {
+                } catch (final ClientException e) {
                     // do nothing; will retry next inverval
+                    log.debug("Exception", e);
                 }
             }
         }, flushInterval, flushInterval, TimeUnit.MILLISECONDS);
 
         this.sendTimer = Timer.builder("send").register(metrics);
-        this.sendInterruptedCounter = Counter.builder("send").tag(new Tag("state", "interrupted")).register(metrics);
-        this.sendExceptionCounter = Counter.builder("send").tag(new Tag("state", "exception")).register(metrics);
+        this.sendInterruptedCounter = Counter.builder("send").tag(new Tag(STATE, "interrupted"))
+            .register(metrics);
+        this.sendExceptionCounter = Counter.builder("send").tag(new Tag(STATE, "exception")).register(metrics);
 
         this.senderTask = CompletableFuture.runAsync(() -> {
-            while (running.get() || !(acceptQueue.isEmpty())) {
+            while (running.get() || !acceptQueue.isEmpty()) {
 
                 try (Sample timer = sendTimer.start()) {
-                    Span span = acceptQueue.take();
+                    final Span span = acceptQueue.poll(1000, TimeUnit.MILLISECONDS);
                     try {
                         client.send(span);
-                    } catch (ClientException e) {
+                    } catch (final ClientException e) {
                         sendExceptionCounter.increment();
                         LOGGER.error("Client reported a failure:", e);
                     }
-                } catch (InterruptedException e) {
+                } catch (final InterruptedException e) {
                     // do nothing; will retry next interation
                     sendInterruptedCounter.increment();
                 }
@@ -98,17 +120,20 @@ public class RemoteDispatcher implements Dispatcher {
 
         // held in the registry; but we don't need a local reference
         Gauge.builder("acceptQueue", acceptQueue, Collection::size)
-                .register(metrics);
-        Gauge.builder("running", running, (running) -> (running.get() ? 1 : 0))
-                .register(metrics);
+            .register(metrics);
+        Gauge.builder("running", running, running -> running.get() ? 1 : 0)
+            .register(metrics);
 
         this.dispatchTimer = Timer.builder("dispatch").register(metrics);
-        this.dispatchRejectedCounter = Counter.builder("dispatch").tag(new Tag("state", "rejected")).register(metrics);
+        this.dispatchRejectedCounter = Counter.builder("dispatch").tag(new Tag(STATE, "rejected"))
+            .register(metrics);
 
-        this.closeTimer = Timer.builder("close").register(metrics);
-        this.closeTimeoutCounter = Counter.builder("close").tag(new Tag("state", "timeout")).register(metrics);
-        this.closeInterruptedCounter = Counter.builder("close").tag(new Tag("state", "interrupted")).register(metrics);
-        this.closeExceptionCounter = Counter.builder("close").tag(new Tag("state", "exception")).register(metrics);
+        this.closeTimer = Timer.builder(CLOSE_NAME).register(metrics);
+        this.closeTimeoutCounter = Counter.builder(CLOSE_NAME).tag(new Tag(STATE, "timeout")).register(metrics);
+        this.closeInterruptedCounter = Counter.builder(CLOSE_NAME).tag(new Tag(STATE, "interrupted"))
+            .register(metrics);
+        this.closeExceptionCounter = Counter.builder(CLOSE_NAME).tag(new Tag(STATE, "exception"))
+            .register(metrics);
 
         this.flushTimer = Timer.builder("flush").register(metrics);
     }
@@ -116,12 +141,12 @@ public class RemoteDispatcher implements Dispatcher {
     @Override
     public String toString() {
         return new ReflectionToStringBuilder(this, ToStringStyle.SIMPLE_STYLE)
-                .setExcludeFieldNames("acceptQueue", "executor", "flushTask", "senderTask")
-                .toString();
+            .setExcludeFieldNames("acceptQueue", "executor", "flushTask", "senderTask")
+            .toString();
     }
 
     @Override
-    public void dispatch(Span span) {
+    public void dispatch(final Span span) {
         try (Sample timer = dispatchTimer.start()) {
             if (running.get()) {
                 final boolean accepted = acceptQueue.offer(span);
@@ -137,18 +162,19 @@ public class RemoteDispatcher implements Dispatcher {
     }
 
     @Override
+    @SuppressWarnings("PMD.UseTryWithResources")
     public void close() {
         try (Sample timer = closeTimer.start()) {
             running.set(false);
 
             try {
                 senderTask.get(shutdownTimeoutMillis, TimeUnit.MILLISECONDS);
-            } catch (TimeoutException e) {
+            } catch (final TimeoutException e) {
                 // failed to fully flush the queue so force canceling
                 closeTimeoutCounter.increment();
                 LOGGER.warn("Timeout attempting to fully empty the queue before shutting down");
                 senderTask.cancel(true);
-            } catch (InterruptedException e) {
+            } catch (final InterruptedException e) {
                 LOGGER.warn("Interrupted attempting to shutting down");
                 closeInterruptedCounter.increment();
                 senderTask.cancel(true);
@@ -162,7 +188,7 @@ public class RemoteDispatcher implements Dispatcher {
 
                 try {
                     executor.shutdown();
-                } catch (SecurityException e) {
+                } catch (final SecurityException e) {
                     closeExceptionCounter.increment();
                     LOGGER.warn("Executor pool failed to close", e);
                 }
@@ -178,18 +204,18 @@ public class RemoteDispatcher implements Dispatcher {
     }
 
     public static final class Builder {
-        private Metrics metrics;
-        private Client client;
+        private final Metrics metrics;
+        private final Client<Span> client;
         private BlockingQueue<Span> acceptQueue;
         private long flushInterval;
         private long shutdownTimeout;
         private ScheduledExecutorService executor;
 
-        public Builder(MetricsRegistry registry, Client client) {
+        public Builder(final MetricsRegistry registry, final Client<Span> client) {
             this(new Metrics(registry, Dispatcher.class.getName(), Arrays.asList(new Tag("type", "remote"))), client);
         }
 
-        public Builder(Metrics metrics, Client client) {
+        public Builder(final Metrics metrics, final Client<Span> client) {
             this.metrics = metrics;
             this.client = client;
             acceptQueue = new ArrayBlockingQueue<>(1000);
@@ -198,32 +224,32 @@ public class RemoteDispatcher implements Dispatcher {
             executor = Executors.newScheduledThreadPool(Runtime.getRuntime().availableProcessors());
         }
 
-        public Builder withExecutor(ScheduledExecutorService executor) {
+        public Builder withExecutor(final ScheduledExecutorService executor) {
             this.executor = executor;
             return this;
         }
 
-        public Builder withExecutorThreadCount(int threads) {
+        public Builder withExecutorThreadCount(final int threads) {
             executor = Executors.newScheduledThreadPool(threads);
             return this;
         }
 
-        public Builder withBlockingQueue(BlockingQueue<Span> acceptQueue) {
+        public Builder withBlockingQueue(final BlockingQueue<Span> acceptQueue) {
             this.acceptQueue = acceptQueue;
             return this;
         }
 
-        public Builder withBlockingQueueLimit(int limit) {
+        public Builder withBlockingQueueLimit(final int limit) {
             this.acceptQueue = new ArrayBlockingQueue<>(limit);
             return this;
         }
 
-        public Builder withFlushIntervalMillis(long flushInterval) {
+        public Builder withFlushIntervalMillis(final long flushInterval) {
             this.flushInterval = flushInterval;
             return this;
         }
 
-        public Builder withShutdownTimeoutMillis(long shutdownTimeout) {
+        public Builder withShutdownTimeoutMillis(final long shutdownTimeout) {
             this.shutdownTimeout = shutdownTimeout;
             return this;
         }
